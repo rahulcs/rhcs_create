@@ -1,0 +1,792 @@
+#!/bin/bash
+
+#SMclient version
+sm_client_version=`rpm -qa|grep SMclient`
+
+#Name of volume group associated with the logical volume manager
+clus_lvm="lvm_vg"
+
+# Defines how verbose the master log file is
+# 0 - only errors
+# 1 - errors, warnings
+# 2 - errors, warnings, and relavent notes
+# 3 - errors, warnings, all notes
+std_err_lvl=3
+
+# Where to save output of devices in raw form
+# Currently hold output of 
+# SMdevices (mpp)
+# multipath -ll (dmmp)
+std_device_output="logs/devices.out"
+
+# target file or "t" file. This file contains
+# what targets to run IO to
+std_datfile=t
+
+# the master log file
+std_master_log="testutils"
+
+std_target="on"
+
+clus_node1=""
+clus_node2=""
+clus_node3=""
+clus_node4=""
+
+##################################################################################
+# FUNCTION: set_progress
+#
+# Description: creates a progress bar, 1st arg is the name, 2nd arg is progress (0-100)
+# Revisions  :
+
+set_progress(){
+        clear
+        tput cup 0 0
+        tput civis
+        local window_width=$(tput cols)
+        local title=$1
+        local progress=$2
+        local bar_width=$(($window_width-${#title}-${#progress}-10))
+        local bar_count=$((bar_width*progress/100))
+        local space_count=$((bar_width-bar_count))
+        echo -n " $title |"
+        for(( incrementer=0; incrementer < bar_count; incrementer++))
+        do
+                echo -en '\E[1m'
+                echo -en '\E[40m'
+                echo -n " "
+        done
+        for(( incrementer=0; incrementer < space_count; incrementer++))
+        do
+                echo -en '\E[1m'
+                echo -en '\E[47m'
+                echo -n " "
+        done
+        tput sgr0
+        if [ "${#progress}" = "3" ]; then
+                echo "| [$progress%] "
+        else
+                echo "| [ $progress%] "
+        fi
+        tput cnorm
+}
+
+###################################################################################
+# FUNCTION: echo_error 
+#
+# Description: Displays an error message, Red font
+# Revisions :
+
+echo_error(){
+
+        echo -en '\E[1m'    # BOLD
+        echo -en '\E[31m'   # Foreground = Red
+        echo -en '\E[40m'   # Background = Black
+        echo -e "ERROR: $@"
+        tput sgr0
+        echo
+
+        any_key
+}
+
+
+########################################################################    
+create_std_datfile(){
+
+        if [ "$sm_client_version" = "" ]; then
+                echo
+                echo_error "SMClient not installed. Failover cannot be MPP (SMdevices command must be present)!"
+                exit 1
+        fi
+        SMdevices > $std_device_output
+        if [ $? != 0 ] ; then
+                echo_error "Cannot save SMdevices info into $std_device_output"
+                if [ -f $std_datfile ]; then
+                        rm -f $std_datfile;
+                fi
+                exit 1
+        fi
+
+        root_boot=`egrep "rootboot|rb" $std_device_output`
+        if [ "$root_boot" != "" ]; then
+                root_boot="yes"
+        else
+                root_boot="no"
+        fi
+
+        # Create target "std_datfile"
+        cat $std_device_output | grep /dev/ | grep -v "<n/a>" | grep -v "Access" | grep -iv "rootboot" | grep -iv "rb" | awk '{print $1}' > $std_datfile 
+        
+        # make sure there are luns in std_datfile
+        if [ ! -s $std_datfile ] ; then
+                smdevices_error="No Luns found!"
+                return
+        fi
+}
+
+#################################################################################
+# SCRIPT: host_identifier
+#
+# Description: Method to identify the hostname 
+#              and add the hostname ( if not present )
+#              in /etc/hosts
+#
+
+
+host_identifier()
+{
+    local clus_ip=$1
+    local node=$2
+
+    if [ $(grep -c $clus_ip /etc/hosts) -eq 0 ]; then
+        echo "The node is not present in /etc/hosts. So adding the node"
+        local clus_node=`ssh $clus_ip hostname`
+        echo "$clus_ip    $clus_node" >> /etc/hosts
+    else
+        local clus_node=`grep $clus_ip /etc/hosts | awk '{print $2}'`
+    fi
+
+    case $node in
+        1)      clus_node1=$clus_node;;
+        2)      clus_node2=$clus_node;;
+        3)      clus_node3=$clus_node;;
+        4)      clus_node4=$clus_node;;
+        *)      exit 1
+    esac
+}
+
+
+##################################################################################
+# SCRIPT: send_log
+#
+# Description: Standard method to output a line to the logs file
+#              $1 - calling function
+#              $2 - status where 1-Error, 2-Warning, 3-(none), 4-Unknown
+#              $3 - output
+# Revisions  : 
+
+send_log(){
+
+        local calling_func=$1
+        local status=$2
+        local message=$3
+        local ed_today=`date | awk '{print $2 " " $3 " " $4}'`
+        local today=`date +%F`
+
+        case $status in
+                1)      echo "$ed_today [$calling_func]: [ERROR] $message" >> logs/$std_master_log-$today;;
+                2)      echo "$ed_today [$calling_func]: [WARNING] $message" >> logs/$std_master_log-$today;;
+                3)      echo "$ed_today [$calling_func]: $message" >> logs/$std_master_log-$today;;
+                *)      echo "$ed_today [$calling_func]: [UNKNOWN] $message" >> logs/$std_master_log-$today;;
+        esac
+}
+
+##################################################################################
+# FUNCTION: any_key
+#
+# Description: Prints parameters and prompts to continue
+# Revisions  : 
+
+any_key(){
+
+        echo "$@"       
+        echo -en "Press any key to continue..."
+        # Making input silent causes ctrl-c issues on the terminal
+        #read -s -n 1
+        read -n 1
+        echo
+        return 
+}
+
+
+###################################################################################
+# FUNCTION: clus_rh
+#
+# Description: Creates resources for RedHat Cluster Suite for 4-node cluster.
+# Revisions : Removed all copycomp steps, use LinuxSmash via NFS to write IO
+#             Added in more text output to screen.
+#
+
+
+clus_rh()
+{
+    
+	send_log clus_rh 3 "Creating Resources for RedHat Cluster Suite" 
+	local user_in=""
+	local get_name=1
+	local harness=""
+	local n2_found=0
+
+	clear
+	
+	#Enter all details to set-up 4-node cluster.
+	read -p "Enter Node 1 IP: " clus_ip1
+	host_identifier $clus_ip1 1
+	read -p "Enter Node 2 IP: " clus_ip2
+	host_identifier $clus_ip2 2
+	read -p "Enter Node 3 IP: " clus_ip3
+	host_identifier $clus_ip3 3
+	read -p "Enter Node 4 IP: " clus_ip4
+	host_identifier $clus_ip4 4
+	read -p "Enter host harness IP: " harness
+	read -p "Enter Virtual IP 1: " clus_export_ip1
+	read -p "Enter Virtual IP 2: " clus_export_ip2
+	read -p "Enter Virtual IP 3: " clus_export_ip3
+	read -p "Enter Virtual IP 4: " clus_export_ip4
+	
+	#Creating target file from SMdevices output.
+	SMdevices | grep -i "/dev/sd*" |awk '{print $1}' > t
+
+        echo "The cluster nodes are $clus_node1, $clus_node2, $clus_node3, $clus_node4."
+	echo 
+
+	read -p "All the information has been gathered to start Cluster Suite. Please verify on BOTH nodes that the attached devices are NOT mounted. Continue (y/n)?[n] " user_in
+	if [ "$user_in" = "y" -o "$user_in" = "Y" ]; then
+	
+		send_log clus_rh 3 "Create Resources: Starting automated Process"
+		send_log clus_rh 3 "Node1: $clus_node1"
+		send_log clus_rh 3 "Node2: $clus_node2"
+		send_log clus_rh 3 "Node3: $clus_node3"
+		send_log clus_rh 3 "Node4: $clus_node4"
+		send_log clus_rh 3 "Harness IP: $harness"
+		send_log clus_rh 3 "VIP1: $clus_export_ip1"
+		send_log clus_rh 3 "VIP2: $clus_export_ip2"
+		send_log clus_rh 3 "VIP3: $clus_export_ip3"
+		send_log clus_rh 3 "VIP4: $clus_export_ip4"
+
+		set_progress RHCS 4
+		echo "Editing cluster.conf"
+		
+		read -p "Enter cluster name not greater than 16 characters: " CLUSTER
+
+				
+		# Edit the cluster.conf file
+		sed -e "s/clus_name/$CLUSTER/g" cluster4.conf > logs/tmp
+		sed -e "s/node2/$clus_node2/g" logs/tmp > logs/tmp1
+		sed -e "s/node3/$clus_node3/g" logs/tmp1 > logs/tmp
+		sed -e "s/export_ip1/$clus_export_ip1/g" logs/tmp > logs/tmp1
+		sed -e "s/export_ip2/$clus_export_ip2/g" logs/tmp1 > logs/tmp
+		sed -e "s/node1/$clus_node1/g" logs/tmp > logs/tmp1
+		sed -e "s/node4/$clus_node4/g" logs/tmp1 > logs/tmp
+		sed -e "s/export_ip3/$clus_export_ip3/g" logs/tmp > logs/tmp1
+		sed -e "s/export_ip4/$clus_export_ip4/g" logs/tmp1 > logs/tmp
+		
+		cat logs/tmp
+
+		# copy cluster.conf to all nodes
+		cp logs/tmp /etc/cluster/cluster.conf
+		scp -q /etc/cluster/cluster.conf root@$clus_node2:/etc/cluster/
+		scp -q /etc/cluster/cluster.conf root@$clus_node3:/etc/cluster/
+		scp -q /etc/cluster/cluster.conf root@$clus_node4:/etc/cluster/
+
+		send_log clus_rh 3 "Create Resources: cluster.conf moved to $clus_node2, $clus_node3 & $clus_node4"
+
+		set_progress RHCS 10
+		echo "Editing Locking Type"
+		
+		# Check distro to set the cluster locking type
+		if [ "${linux_distro%U*}" = "RH4" ]; then
+			sed -e "s/locking_type = 1/locking_type = 2/g" /etc/lvm/lvm.conf > logs/tmp
+			tmp=`cat logs/tmp | grep "locking_library = "`
+			sed -e "s/$tmp/locking_library = \"liblvm2clusterlock.so\"/g" logs/tmp > /etc/lvm/lvm.conf
+			scp -q /etc/lvm/lvm.conf root@$clus_node2:/etc/lvm/
+			scp -q /etc/lvm/lvm.conf root@$clus_node3:/etc/lvm/
+			scp -q /etc/lvm/lvm.conf root@$clus_node4:/etc/lvm/
+		else
+			sed -e "s/locking_type = 1/locking_type = 3/g" /etc/lvm/lvm.conf > logs/tmp
+			cp logs/tmp /etc/lvm/lvm.conf
+			scp -q /etc/lvm/lvm.conf root@$clus_node2:/etc/lvm/
+			scp -q /etc/lvm/lvm.conf root@$clus_node3:/etc/lvm/
+			scp -q /etc/lvm/lvm.conf root@$clus_node4:/etc/lvm/
+		fi
+		rm -f logs/tmp logs/tmp1
+		
+		send_log clus_rh 3 "Create Resources: lvm.conf edited"
+		
+		set_progress RHCS 15
+		echo "Creating Targets File"
+		
+		local i=1
+		local var=""
+		local devs=""
+
+		set_progress RHCS 20 
+		echo "Creating Physical Volumes"
+
+		# FDISK and create luns viewable by LVM
+		for var in `cat t | sort | uniq`
+		do
+			echo "$var"
+			(
+				echo d
+				echo w
+			)|fdisk $var >> /dev/null 2>&1
+			pvcreate -ff -y $var >> logs/pvcreate.tmp 2>&1
+			devs[${#devs[*]}]=$var
+			sleep 1
+			let i=i+1
+		done
+
+		send_log clus_rh 3 "Create Resources: physical volumes created"
+		
+		set_progress RHCS 30
+		echo "Starting Services"
+
+		chkconfig gfs on
+		service gfs start >> logs/services.tmp
+		ssh $clus_node2 "chkconfig gfs on"
+		ssh $clus_node2 "service gfs start" >> logs/services.tmp
+		ssh $clus_node3 "chkconfig gfs on"
+		ssh $clus_node3 "service gfs start" >> logs/services.tmp
+		ssh $clus_node3 "chkconfig gfs on"
+		ssh $clus_node3 "service gfs start" >> logs/services.tmp
+	
+		if [ "${linux_distro%U*}" = "RH4" ]; then
+			chkconfig ccsd on
+			service ccsd start >> logs/services.tmp
+			ssh $clus_node2 "chkconfig ccsd on"
+			ssh $clus_node2 "service ccsd start" >> logs/services.tmp
+			ssh $clus_node3 "chkconfig ccsd on"
+			ssh $clus_node3 "service ccsd start" >> logs/services.tmp
+			ssh $clus_node4 "chkconfig ccsd on"
+			ssh $clus_node4 "service ccsd start" >> logs/services.tmp
+		fi
+
+		chkconfig cman on
+		service cman start & >> logs/services.tmp
+		ssh $clus_node2 "chkconfig cman on"
+		ssh $clus_node2 "service cman start" >> logs/services.tmp
+		ssh $clus_node3 "chkconfig cman on"
+		ssh $clus_node3 "service cman start" >> logs/services.tmp
+		ssh $clus_node4 "chkconfig cman on"
+		ssh $clus_node4 "service cman start" >> logs/services.tmp
+
+		chkconfig clvmd on
+		service clvmd start >> logs/services.tmp
+		ssh $clus_node2 "chkconfig clvmd on"
+		ssh $clus_node2 "service clvmd start" >> logs/services.tmp
+		ssh $clus_node3 "chkconfig clvmd on"
+		ssh $clus_node3 "service clvmd start" >> logs/services.tmp
+		ssh $clus_node4 "chkconfig clvmd on"
+		ssh $clus_node4 "service clvmd start" >> logs/services.tmp
+
+		chkconfig rgmanager on
+		service rgmanager start >> logs/services.tmp
+		ssh $clus_node2 "chkconfig rgmanager on"
+		ssh $clus_node2 "service rgmanager start" logs/services.tmp
+		ssh $clus_node3 "chkconfig rgmanager on"
+		ssh $clus_node3 "service rgmanager start" logs/services.tmp
+		ssh $clus_node4 "chkconfig rgmanager on"
+		ssh $clus_node4 "service rgmanager start" logs/services.tmp
+	
+		chkconfig scsi_reserve on
+		service scsi_reserve start >> logs/services.tmp
+		ssh $clus_node2 "chkconfig scsi_reserve on"
+		ssh $clus_node2 "service scsi_reserve start" >> logs/services.tmp
+		ssh $clus_node3 "chkconfig scsi_reserve on"
+		ssh $clus_node3 "service scsi_reserve start" >> logs/services.tmp
+		ssh $clus_node4 "chkconfig scsi_reserve on"
+		ssh $clus_node4 "service scsi_reserve start" >> logs/services.tmp
+		
+		if [ "${linux_distro%U*}" = "RH4" ]; then
+			chkconfig fenced on
+			service fenced start >> logs/services.tmp
+			ssh $clus_node2 "chkconfig fenced on"
+			ssh $clus_node2 "service fenced start" logs/services.tmp
+			ssh $clus_node3 "chkconfig fenced on"
+			ssh $clus_node3 "service fenced start" logs/services.tmp
+			ssh $clus_node4 "chkconfig fenced on"
+			ssh $clus_node4 "service fenced start" logs/services.tmp
+		fi
+		
+		send_log clus_rh 3 "Create Resources: Services started"
+
+		set_progress RHCS 50
+		echo "Pooling Volumes"
+	
+		# pool the physical volumes into a volume group
+		vgcreate  $clus_lvm ${devs[@]} >> logs/vgcreate
+		
+		send_log clus_rh 3 "Create Resources: Volume Group created"
+
+		# get the size of the volume group
+		local group_size=`vgdisplay $clus_lvm | grep "VG Size" | awk '{print $3}'`
+		local size_label=`vgdisplay $clus_lvm | grep "VG Size" | awk '{print $4}'`
+
+		# partition the groop into 8 logical luns
+		echo "Total Pool Size - $group_size $size_label"
+		group_size=`echo $group_size | awk '{print $group_size * 1000}'`
+		group_size=`echo $group_size | awk '{print $group_size / 9}'`
+
+		set_progress RHCS 70
+		echo "Creating 8 Logical Luns of size $group_size"
+		
+		# create logical volumes, GFS, and mount
+		for ((i=0; i<8; i++))
+		do
+			echo -n "Creating Logical Volume lvol$i... "
+			lvcreate -L ${group_size}M $clus_lvm >> logs/lvcreate.tmp 2>&1
+			if [ "$?" != "0" ]; then
+				echo_error "Could not create Logical Volume lvol$i ($group_size MB) on /dev/$clus_lvm"
+				any_key
+				return
+			fi
+
+			echo "creating global filesystem on lvol$i (/dev/$clus_lvm/lvol$i)..."
+			gfs_mkfs -O -q -t $CLUSTER:gfs_vol$i -p lock_dlm -j 4 /dev/$clus_lvm/lvol$i >> logs/gfs.tmp 2>&1
+
+			if [ "$?" != "0" ]; then
+				echo_error "Could not create GFS file system on /dev/$clus_lvm/lvol$i"
+				any_key
+				return
+			fi
+
+			# Add fstab entries for the GFS volumes
+			echo "/dev/$clus_lvm/lvol$i    /home/smashmnt$i        gfs     defaults        0 0" >> /etc/fstab
+			
+
+			#make the smashmnt points
+			if [ ! -d /home/smashmnt$i ]; then
+				mkdir /home/smashmnt$i
+			fi
+		done
+
+		echo "Backing up fstab entries of other nodes is fstab.bak"
+		ssh $clus_node2 'cp /etc/fstab /etc/fstab.bak'
+		ssh $clus_node3 'cp /etc/fstab /etc/fstab.bak'
+		ssh $clus_node4 'cp /etc/fstab /etc/fstab.bak'
+
+		scp -rq /etc/fstab root@$clus_node2:/etc/
+		scp -rq /etc/fstab root@$clus_node3:/etc/
+		scp -rq /etc/fstab root@$clus_node4:/etc/
+		
+		send_log clus_rh 3 "Create Resources: GFS volume created from Volume Groups"
+
+		# umount /home/smashmnts on alt nodes
+		ssh $clus_node2 "
+			if [ -d /home/smashmnt* ]; then
+				umount /home/smashmnt*;
+			fi " >> /dev/null 2>&1
+		ssh $clus_node3 "
+			if [ -d /home/smashmnt* ]; then
+				umount /home/smashmnt*;
+			fi " >> /dev/null 2>&1
+		ssh $clus_node4 "
+			if [ -d /home/smashmnt* ]; then
+				umount /home/smashmnt*;
+			fi " >> /dev/null 2>&1
+	
+		scp -rq /home/smashmnt* root@$clus_node2:/home/
+		scp -rq /home/smashmnt* root@$clus_node3:/home/
+		scp -rq /home/smashmnt* root@$clus_node4:/home/
+
+		set_progress RHCS 80
+		echo "Mounting GFS luns"
+		
+		# mount luns from fstab
+		mount -a >> /dev/null 2>&1
+
+		# copy fstab to alternate host and mount
+		#scp /etc/fstab root@$clus_node2:/etc/
+		ssh $clus_node2 "mount -a" >> /dev/null 2>&1
+		ssh $clus_node3 "mount -a" >> /dev/null 2>&1
+		ssh $clus_node4 "mount -a" >> /dev/null 2>&1
+		
+		send_log clus_rh 3 "Create Resources: GFS luns mounted"
+
+		set_progress RHCS 90
+		echo "Creating exports file"
+		# Edit /etc/exports
+		sed -e "s/harness/$harness/g" exports > /etc/exports
+		scp -q /etc/exports root@$clus_node2:/etc/
+		scp -q /etc/exports root@$clus_node2:/etc/
+		scp -q /etc/exports root@$clus_node2:/etc/
+		
+		echo "Starting NFS"
+		chkconfig nfs on
+		service nfs start >> logs/services.tmp
+		ssh $clus_node2 "chkconfig nfs on"
+		ssh $clus_node2 "service nfs start" >> logs/services.tmp
+		ssh $clus_node3 "chkconfig nfs on"
+		ssh $clus_node3 "service nfs start" >> logs/services.tmp
+		ssh $clus_node4 "chkconfig nfs on"
+		ssh $clus_node4 "service nfs start" >> logs/services.tmp
+
+		send_log clus_rh 3 "Create Resources: NFS started"
+		
+		clear
+		echo "RHCS Scripts have finished!"
+		send_log clus_rh 3 "Create Resources: Finished"
+		any_key
+	fi
+}
+
+
+###################################################################################
+# FUNCTION: clus_rh2 
+#
+# Description: Creates resources for RedHat Cluster Suite for 2 node cluster.
+# Revisions : Removed all copycomp steps, use LinuxSmash via NFS to write IO
+#             Added in more text output to screen.
+#
+
+
+clus_rh2()
+{
+
+	send_log clus_rh2 3 "Creating Resources for RedHat Cluster Suite"
+	local user_in=""
+	local get_name=1
+	local harness=""
+	local n2_found=0
+
+	clear
+	#Enter all details to set-up 4-node cluster.
+	read -p "Enter Node 1 IP: " clus_ip1
+	host_identifier $clus_ip1 1
+	read -p "Enter Node 2 IP: " clus_ip2
+	host_identifier $clus_ip2 2
+	read -p "Enter host harness IP: " harness
+	read -p "Enter Virtual IP 1: " clus_export_ip1
+	read -p "Enter Virtual IP 2: " clus_export_ip2
+
+	
+	#Creating target file from SMdevices output.
+	SMdevices | grep -i "/dev/sd*" |awk '{print $1}' > t
+
+        echo "The cluster nodes are $clus_node1, $clus_node2."
+	echo 
+
+	read -p "All the information has been gathered to start Cluster Suite. Please verify on BOTH nodes that the attached devices are NOT mounted. Continue (y/n)?[n] " user_in
+	if [ "$user_in" = "y" -o "$user_in" = "Y" ]; then
+	
+		send_log clus_rh2 3 "Create Resources: Starting automated Process"
+		send_log clus_rh2 3 "Node1: $clus_node1"
+		send_log clus_rh2 3 "Node2: $clus_node2"
+		send_log clus_rh2 3 "Harness IP: $harness"
+		send_log clus_rh2 3 "VIP1: $clus_export_ip1"
+		send_log clus_rh2 3 "VIP2: $clus_export_ip2"
+
+		set_progress RHCS 4
+		echo "Editing cluster.conf"
+
+		read -p "Enter cluster name not greater than 16 characters: " CLUSTER
+		
+		# Edit the cluster.conf file
+		sed -e "s/clus_name/$CLUSTER/g" cluster.conf > logs/tmp
+		sed -e "s/node2/$clus_node2/g" logs/tmp > logs/tmp1
+		sed -e "s/export_ip1/$clus_export_ip1/g" logs/tmp1 > logs/tmp
+		sed -e "s/export_ip2/$clus_export_ip2/g" logs/tmp > logs/tmp1
+		sed -e "s/node1/$clus_node1/g" logs/tmp1 > logs/tmp
+
+		# copy cluster.conf to both nodes
+		cp logs/tmp /etc/cluster/cluster.conf
+		scp -q /etc/cluster/cluster.conf root@$clus_node2:/etc/cluster/
+		
+		send_log clus_rh2 3 "Create Resources: cluster.conf moved to $clus_node2"
+
+		set_progress RHCS 10
+		echo "Editing Locking Type"
+		
+		# Check distro to set the cluster locking type
+		if [ "${linux_distro%U*}" = "RH4" ]; then
+			sed -e "s/locking_type = 1/locking_type = 2/g" /etc/lvm/lvm.conf > logs/tmp
+			tmp=`cat logs/tmp | grep "locking_library = "`
+			sed -e "s/$tmp/locking_library = \"liblvm2clusterlock.so\"/g" logs/tmp > /etc/lvm/lvm.conf
+			scp -q /etc/lvm/lvm.conf root@$clus_node2:/etc/lvm/
+		else
+			sed -e "s/locking_type = 1/locking_type = 3/g" /etc/lvm/lvm.conf > logs/tmp
+			cp logs/tmp /etc/lvm/lvm.conf
+			scp -q /etc/lvm/lvm.conf root@$clus_node2:/etc/lvm/
+		fi
+		rm -f logs/tmp logs/tmp1
+		
+		send_log clus_rh2 3 "Create Resources: lvm.conf edited"
+		
+		
+		local i=1
+		local var=""
+		local devs=""
+
+		set_progress RHCS 20 
+		echo "Creating Physical Volumes"
+
+		# FDISK and create luns viewable by LVM
+		for var in `cat t | sort | uniq`
+		do
+			echo "$var"
+			(
+				echo d
+				echo w
+			)|fdisk $var >> /dev/null 2>&1
+			pvcreate -ff -y $var >> logs/pvcreate.tmp 2>&1
+			devs[${#devs[*]}]=$var
+			sleep 1
+			let i=i+1
+		done
+
+		send_log clus_rh2 3 "Create Resources: physical volumes created"
+		
+		set_progress RHCS 30
+		echo "Starting Services"
+
+		chkconfig gfs on
+		service gfs start >> logs/services.tmp
+		ssh $clus_node2 "chkconfig gfs on"
+		ssh $clus_node2 "service gfs start" >> logs/services.tmp
+	
+		if [ "${linux_distro%U*}" = "RH4" ]; then
+			chkconfig ccsd on
+			service ccsd start >> logs/services.tmp
+			ssh $clus_node2 "chkconfig ccsd on"
+			ssh $clus_node2 "service ccsd start" >> logs/services.tmp
+		fi
+
+		chkconfig cman on
+		service cman start & >> logs/services.tmp
+		ssh $clus_node2 "chkconfig cman on"
+		ssh $clus_node2 "service cman start" >> logs/services.tmp
+
+		chkconfig clvmd on
+		service clvmd start >> logs/services.tmp
+		ssh $clus_node2 "chkconfig clvmd on"
+		ssh $clus_node2 "service clvmd start" >> logs/services.tmp
+
+		chkconfig rgmanager on
+		service rgmanager start >> logs/services.tmp
+		ssh $clus_node2 "chkconfig rgmanager on"
+		ssh $clus_node2 "service rgmanager start" logs/services.tmp
+	
+		chkconfig scsi_reserve on
+		service scsi_reserve start >> logs/services.tmp
+		ssh $clus_node2 "chkconfig scsi_reserve on"
+		ssh $clus_node2 "service scsi_reserve start" >> logs/services.tmp
+		
+		if [ "${linux_distro%U*}" = "RH4" ]; then
+			chkconfig fenced on
+			service fenced start >> logs/services.tmp
+			ssh $clus_node2 "chkconfig fenced on"
+			ssh $clus_node2 "service fenced start" logs/services.tmp
+		fi
+		
+		send_log clus_rh2 3 "Create Resources: Services started"
+
+		set_progress RHCS 50
+		echo "Pooling Volumes"
+	
+		# pool the physical volumes into a volume group
+		vgcreate  $clus_lvm ${devs[@]} >> logs/vgcreate
+		
+		send_log clus_rh2 3 "Create Resources: Volume Group created"
+
+		# get the size of the volume group
+		local group_size=`vgdisplay $clus_lvm | grep "VG Size" | awk '{print $3}'`
+		local size_label=`vgdisplay $clus_lvm | grep "VG Size" | awk '{print $4}'`
+
+		# partition the groop into 8 logical luns
+		echo "Total Pool Size - $group_size $size_label"
+		group_size=`echo $group_size | awk '{print $group_size * 1000}'`
+		group_size=`echo $group_size | awk '{print $group_size / 9}'`
+
+		set_progress RHCS 70
+		echo "Creating 8 Logical Luns of size $group_size"
+		
+		# create logical volumes, GFS, and mount
+		for ((i=0; i<8; i++))
+		do
+			echo -n "Creating Logical Volume lvol$i... "
+			lvcreate -L ${group_size}M $clus_lvm >> logs/lvcreate.tmp 2>&1
+			if [ "$?" != "0" ]; then
+				echo_error "Could not create Logical Volume lvol$i ($group_size MB) on /dev/$clus_lvm"
+				any_key
+				return
+			fi
+
+			echo "creating global filesystem on lvol$i (/dev/$clus_lvm/lvol$i)..."
+			gfs_mkfs -O -q -t $CLUSTER:gfs_vol$i -p lock_dlm -j 4 /dev/$clus_lvm/lvol$i >> logs/gfs.tmp 2>&1
+
+			if [ "$?" != "0" ]; then
+				echo_error "Could not create GFS file system on /dev/$clus_lvm/lvol$i"
+				any_key
+				return
+			fi
+
+			# Add fstab entries for the GFS volumes
+			echo "/dev/$clus_lvm/lvol$i    /home/smashmnt$i        gfs     defaults        0 0" >> /etc/fstab
+
+			#make the smashmnt points
+			if [ ! -d /home/smashmnt$i ]; then
+				mkdir /home/smashmnt$i
+			fi
+		done
+		
+		echo "Backing up fstab entries of other nodes is fstab.bak"
+		ssh $clus_node2 'cp /etc/fstab /etc/fstab.bak'
+
+		send_log clus_rh2 3 "Create Resources: GFS volume created from Volume Groups"
+
+		# umount /home/smashmnts on alt node
+		ssh $clus_node2 "
+			if [ -d /home/smashmnt* ]; then
+				umount /home/smashmnt*;
+			fi " >> /dev/null 2>&1
+	
+		scp -rq /home/smashmnt* root@$clus_node2:/home/
+
+		set_progress RHCS 80
+		echo "Mounting GFS luns"
+		
+		# mount luns from fstab
+		mount -a >> /dev/null 2>&1
+
+		# copy fstab to alternate host and mount
+		scp /etc/fstab root@$clus_node2:/etc/
+		ssh $clus_node2 "mount -a" >> /dev/null 2>&1
+		
+		send_log clus_rh2 3 "Create Resources: GFS luns mounted"
+
+		set_progress RHCS 90
+		echo "Creating exports file"
+		# Edit /etc/exports
+		sed -e "s/harness/$harness/g" exports > /etc/exports
+		scp -q /etc/exports root@$clus_node2:/etc/
+		
+		echo "Starting NFS"
+		chkconfig nfs on
+		service nfs start >> logs/services.tmp
+		ssh $clus_node2 "chkconfig nfs on"
+		ssh $clus_node2 "service nfs start" >> logs/services.tmp
+
+		send_log clus_rh2 3 "Create Resources: NFS started"
+		
+		clear
+		echo "RHCS Scripts have finished!"
+		send_log clus_rh2 3 "Create Resources: Finished"
+		any_key
+	fi
+}
+
+###################################################################################
+#
+# Author : Rahul Subrahmanya
+
+read -p "Enter the number of nodes in the cluster: " clus_node_num
+
+if [ $clus_node_num -lt 2 ]; then
+    echo "Atleast 2 nodes are required for the creation of cluster."
+    exit 1
+elif [ $clus_node_num -eq 2 ]; then
+    echo "Its a 2 node cluster"
+    clus_rh2
+elif [ $clus_node_num -eq 4 ]; then
+    echo "Creating 4-Node Cluster.."
+    clus_rh
+else
+    echo "The input you have given is not valid. This script creates only 2-node and 4-node cluster"
+    exit 1
+fi
+
+
+
+
+email: rahulcssjce@gmail.com

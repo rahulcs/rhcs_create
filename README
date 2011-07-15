@@ -1,0 +1,92 @@
+*******************************************************************************
+
+NAME            README
+SUMMARY        	HOW TO USE THE RHCS CLUSTER CREATION SCRIPT
+VERSION         1.0
+PROGRAMMER      Rahul C S
+
+
+DESCRIPTION:
+	HOW TO USE THE SCRIPT TO CREATE A 4-NODE AND 2-NODE CLUSTERS ON REDHAT USING RHCS
+
+
+*******************************************************************************
+
+All logs are saved in the logs/ directory.
+
+Make sure the nodes forming the cluster are up and ready. Install suitable failover driver and Storage Manager client installed on the node from where the cluster is being created.
+
+
+*******************************************************************************
+
+1) Host IPs
+	- Enter the Host IPs of the nodes forming the cluster.
+
+
+2) Virtual IPs 
+	- Virtual IP addresses for the creation of cluster.
+		Number of IPs depending on the number of nodes present in the cluster.
+
+3) MPP Error Level
+	- Defines mpp's errorlevel (0,1,2,or 3), the lower the number, 
+	  the more mpp debug information will be printed to 
+	  /var/log/messages
+
+4) Harness IP
+	- Harness host IP used to mount volumes from the cluster nodes.
+		Also used for running IO.
+
+
+
+*******************************************************************************
+
+Directory Structure:
+
+rhcs_create.zip -
+
+After untarring the zip, there will be a directory and exactly 1 executable.
+
+Executables:
+
+clus_rhcs - The file contains the variables and functions required for the creation of cluster.
+	    The executable specifically asks the user the required number of nodes.
+	    Right now the script supports only 2 and 4 nodes.
+
+Directories:
+
+logs		- This directory contains nothing initially. Any logs associated with clus_rhcs.sh are contained here
+
+
+Files:
+
+cluster4.conf 	- The file is specifically a template for the 4-node cluster.conf file. The clus_rhcs script sed's the
+		  cluster4.conf and then copies its output into /etc/cluster/ directory.
+
+cluster.conf 	- The file is specifically a template for the 2-node cluster.conf file. After editing the file
+		  it is copied into the /etc/cluster/ directory.	
+
+exports		- The exports file stores the harness IP the user keys in and copies it into /etc/
+
+testutils.conf 	- The file contains variable values for the cluster creation, and has been only used as a reference.
+
+
+*******************************************************************************
+
+HOW TO:
+
+extract rhcs_create.zip -
+	unzip rhcs_create.zip
+	This command will create a collection of files and directories.
+	
+	NOTE: You must have SMclient and a relevant driver in order to run IO.
+		It is suggested that a multipath failover driver is installed 
+		as well.
+
+start creating the cluster resources - 
+	From the shell run clus_rhcs.sh script and keyin appropriate values
+	
+	./clus_rhcs
+
+
+
+email: rahulcssjce@gmail.com

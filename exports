@@ -1,0 +1,8 @@
+/home/smashmnt0	harness(rw,sync,no_root_squash)
+/home/smashmnt1	harness(rw,sync,no_root_squash)
+/home/smashmnt2	harness(rw,sync,no_root_squash)
+/home/smashmnt3	harness(rw,sync,no_root_squash)
+/home/smashmnt4	harness(rw,sync,no_root_squash)
+/home/smashmnt5	harness(rw,sync,no_root_squash)
+/home/smashmnt6	harness(rw,sync,no_root_squash)
+/home/smashmnt7	harness(rw,sync,no_root_squash)
